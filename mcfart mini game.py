@@ -7,9 +7,13 @@ import random
 app = Ursina()
 
 # Configuration
-WORLD_SIZE = 32
-MAX_HEIGHT = 10
+WORLD_SIZE = 24  # Reduced from 32 for better performance
+MAX_HEIGHT = 8   # Reduced from 10
+RENDER_DISTANCE = 16  # Only render blocks within 16 blocks of player
 pnoise = PerlinNoise()
+
+# Store all voxels for culling
+all_voxels = []
 
 # 9-slot hotbar palette (Minecraft-like)
 HOTBAR_PALETTE = ['grass','stone','wood','leaves','dirt','sand','cobble','glass','brick','cactus']
@@ -77,7 +81,8 @@ class BreakingParticle(Entity):
             destroy(self)
 
 def spawn_breaking_particles(position, color):
-    for _ in range(8):
+    # Reduced from 8 to 4 particles for better performance
+    for _ in range(4):
         BreakingParticle(position + Vec3(random.uniform(-0.3, 0.3), random.uniform(-0.3, 0.3), random.uniform(-0.3, 0.3)), color)
 
 # List to track dropped items
@@ -117,6 +122,12 @@ class ItemEntity(Entity):
     def update(self):
         if self.picked_up:
             return
+        
+        # Only update physics every 2nd frame for performance
+        if frame_count % 2 != 0 and self.grounded:
+            # Just rotate if grounded and on even frames
+            self.rotation_y += 90 * time.dt
+            return
             
         # Physics
         if not self.grounded:
@@ -151,37 +162,38 @@ class ItemEntity(Entity):
         # Rotate slowly
         self.rotation_y += 90 * time.dt
         
-        # Check for player pickup
-        try:
-            player_pos = player.position
-            dist = distance(self.position, player_pos)
-            if dist <= 2.0:  # Within 2 blocks
-                # Try to add to hotbar
-                added = False
-                for s in hotbar_slots:
-                    if s['type'] == self.item_type and s['count'] < MAX_STACK_SIZE:
-                        s['count'] += 1
-                        added = True
-                        break
-                if not added:
+        # Check for player pickup (only every 5 frames for performance)
+        if frame_count % 5 == 0:
+            try:
+                player_pos = player.position
+                dist = distance(self.position, player_pos)
+                if dist <= 2.0:  # Within 2 blocks
+                    # Try to add to hotbar
+                    added = False
                     for s in hotbar_slots:
-                        if s['type'] is None:
-                            s['type'] = self.item_type
-                            s['count'] = 1
+                        if s['type'] == self.item_type and s['count'] < MAX_STACK_SIZE:
+                            s['count'] += 1
                             added = True
                             break
-                
-                if added:
-                    self.picked_up = True
-                    destroy(self)
-                    dropped_items.remove(self)
-                    # Pickup sound
-                    try:
-                        winsound.Beep(1200, 30)
-                    except:
-                        pass
-        except:
-            pass
+                    if not added:
+                        for s in hotbar_slots:
+                            if s['type'] is None:
+                                s['type'] = self.item_type
+                                s['count'] = 1
+                                added = True
+                                break
+                    
+                    if added:
+                        self.picked_up = True
+                        destroy(self)
+                        dropped_items.remove(self)
+                        # Pickup sound
+                        try:
+                            winsound.Beep(1200, 30)
+                        except:
+                            pass
+            except:
+                pass
         
         # Despawn timer
         self.life -= 1
@@ -205,6 +217,7 @@ class Voxel(Button):
         self.col = col
         self.breaking_start_time = None
         self.is_breaking = False
+        self.is_visible = True
         # Set hardness based on block type
         if col == color.green:  # Grass
             self.hardness = 0.3
@@ -218,10 +231,21 @@ class Voxel(Button):
             self.hardness = 0.15
         else:
             self.hardness = 0.5
+        all_voxels.append(self)
+    
+    def update_visibility(self, player_pos):
+        """Update visibility based on distance from player."""
+        dist = distance(self.position, player_pos)
+        should_be_visible = dist <= RENDER_DISTANCE
+        if should_be_visible != self.is_visible:
+            self.is_visible = should_be_visible
+            self.enabled = should_be_visible
     
     def input(self, key):
         # Don't allow breaking or placing if crafting UI is open
         if crafting_open:
+            return
+        if not self.is_visible:
             return
         if self.hovered and distance(self.world_position, camera.world_position) <= 7:
             if key == 'left mouse down':
@@ -249,6 +273,8 @@ class Voxel(Button):
                             pass
     
     def update(self):
+        if not self.is_visible:
+            return
         if self.is_breaking and self.breaking_start_time:
             elapsed = time.time() - self.breaking_start_time
             progress = elapsed / self.hardness
@@ -270,6 +296,8 @@ class Voxel(Button):
                     drop_item(self.position, 'sand')
                 elif self.col == CACTUS_COLOR:
                     drop_item(self.position, 'cactus')
+                if self in all_voxels:
+                    all_voxels.remove(self)
                 destroy(self)
             else:
                 self.scale = 0.8 + (0.2 * (1 - progress))
@@ -292,42 +320,95 @@ def generate_cactus(x, y, z):
         Voxel(position=(x, y + i, z), col=CACTUS_COLOR)
 
 def get_biome(x, z):
-    """Determine biome based on position."""
-    # Divide world into 3 vertical strips
-    biome_width = WORLD_SIZE / 3
-    if z < biome_width:
+    """Determine biome using Perlin noise for organic distribution."""
+    # Use noise for biome distribution - adjusted scale for more variety
+    biome_noise = pnoise([x * 0.05, z * 0.05])
+    
+    # Adjusted thresholds to ensure all 3 biomes appear
+    if biome_noise < -0.2:
         return 'plains'
-    elif z < biome_width * 2:
+    elif biome_noise < 0.4:
         return 'mountains'
     else:
         return 'desert'
 
+def get_biome_blend(x, z):
+    """Get blending factor between biomes for smooth transitions."""
+    # Sample multiple points to determine transition
+    center_biome = get_biome(x, z)
+    
+    # Sample nearby points
+    samples = [
+        get_biome(x + 2, z),
+        get_biome(x - 2, z),
+        get_biome(x, z + 2),
+        get_biome(x, z - 2),
+        get_biome(x + 1, z + 1),
+        get_biome(x - 1, z - 1),
+    ]
+    
+    # Check if we're in a transition zone
+    transition_count = sum(1 for s in samples if s != center_biome)
+    blend_factor = transition_count / len(samples)
+    
+    return center_biome, blend_factor
+
+def blend_value(val1, val2, factor):
+    """Blend between two values based on factor (0-1)."""
+    return val1 * (1 - factor) + val2 * factor
+
 def generate_world():
     for z in range(WORLD_SIZE):
         for x in range(WORLD_SIZE):
-            biome = get_biome(x, z)
+            biome, blend_factor = get_biome_blend(x, z)
             noise_val = pnoise([x * 0.1, z * 0.1])
             
-            # Different terrain generation per biome
+            # Get properties for current biome
             if biome == 'plains':
-                # Flat terrain
-                height = int((noise_val + 1) * 4) + 2
+                base_height = int((noise_val + 1) * 4) + 2
                 tree_chance = 0.01
                 surface_block = color.green
                 underground_block = color.brown
+                secondary_block = color.green  # For blending
             elif biome == 'mountains':
-                # Extreme terrain
-                height = int((noise_val + 1) * MAX_HEIGHT * 1.5)
+                base_height = int((noise_val + 1) * MAX_HEIGHT * 1.5)
                 tree_chance = 0.03
                 surface_block = color.green
                 underground_block = color.dark_gray
+                secondary_block = color.brown  # For blending
             else:  # desert
-                # Sandy terrain, flatter
-                height = int((noise_val + 1) * 3) + 2
+                base_height = int((noise_val + 1) * 3) + 2
                 tree_chance = 0
                 surface_block = SAND_COLOR
                 underground_block = SAND_COLOR
+                secondary_block = SAND_COLOR
             
+            # If in transition zone, blend with neighboring biome
+            if blend_factor > 0:
+                # Sample neighboring biome properties
+                neighbor_biome = None
+                for dx, dz in [(2, 0), (-2, 0), (0, 2), (0, -2)]:
+                    nb = get_biome(x + dx, z + dz)
+                    if nb != biome:
+                        neighbor_biome = nb
+                        break
+                
+                if neighbor_biome:
+                    # Blend height
+                    if neighbor_biome == 'plains':
+                        neighbor_height = int((noise_val + 1) * 4) + 2
+                    elif neighbor_biome == 'mountains':
+                        neighbor_height = int((noise_val + 1) * MAX_HEIGHT * 1.5)
+                    else:
+                        neighbor_height = int((noise_val + 1) * 3) + 2
+                    
+                    height = int(blend_value(base_height, neighbor_height, blend_factor * 0.7))
+                else:
+                    height = base_height
+            else:
+                height = base_height
+            
+            # Generate blocks
             for y in range(height):
                 if y == height - 1:
                     block_color = surface_block
@@ -337,14 +418,14 @@ def generate_world():
                     block_color = color.dark_gray
                 Voxel(position=(x, y, z), col=block_color)
             
-            # Biome-specific features
+            # Biome-specific features with smooth transitions
             if biome == 'plains' or biome == 'mountains':
                 # Trees in plains and mountains
-                if random.random() < tree_chance and height > 2:
+                if blend_factor < 0.5 and random.random() < tree_chance and height > 2:
                     generate_tree(x, height, z)
             elif biome == 'desert':
                 # Cacti in desert
-                if random.random() < 0.03 and height > 2:
+                if blend_factor < 0.5 and random.random() < 0.03 and height > 2:
                     generate_cactus(x, height, z)
 
 generate_world()
@@ -700,7 +781,14 @@ def input(key):
                     dragged_item_visual = None
                 dragged_item = None
 
+# Frame counter for optimization
+frame_count = 0
+last_cull_frame = 0
+
 def update():
+    global frame_count, last_cull_frame
+    frame_count += 1
+    
     # Sprinting mechanics
     if held_keys['shift']:
         if not player.is_sprinting:
@@ -713,26 +801,36 @@ def update():
             player.is_sprinting = False
             sprint_text.text = ''
     
-    # Update crosshair and reach indicator
+    # Update visibility culling every 10 frames (performance optimization)
+    if frame_count - last_cull_frame >= 10:
+        last_cull_frame = frame_count
+        try:
+            player_pos = player.position
+            # Only update visibility for a batch of blocks each frame
+            batch_size = 100
+            start_idx = (frame_count // 10 * batch_size) % len(all_voxels)
+            end_idx = min(start_idx + batch_size, len(all_voxels))
+            for voxel in all_voxels[start_idx:end_idx]:
+                if voxel and not voxel.picked_up:
+                    voxel.update_visibility(player_pos)
+        except:
+            pass
+    
+    # Update crosshair and reach indicator (optimized - only check visible blocks)
     try:
         hovered_block = None
-        for entity in scene.children:
-            if isinstance(entity, Voxel) and hasattr(entity, 'hovered') and entity.hovered:
-                dist = distance(entity.world_position, camera.world_position)
+        # Only check visible voxels near player
+        for voxel in all_voxels:
+            if voxel and voxel.is_visible and hasattr(voxel, 'hovered') and voxel.hovered:
+                dist = distance(voxel.world_position, camera.world_position)
                 if dist <= 7:
-                    hovered_block = entity
+                    hovered_block = voxel
                     break
         
         if hovered_block:
-            dist = distance(hovered_block.world_position, camera.world_position)
-            if dist <= 7:
-                crosshair_h.color = color.green
-                crosshair_v.color = color.green
-                reach_indicator.text = ''
-            else:
-                crosshair_h.color = color.red
-                crosshair_v.color = color.red
-                reach_indicator.text = 'Too far!'
+            crosshair_h.color = color.green
+            crosshair_v.color = color.green
+            reach_indicator.text = ''
         else:
             crosshair_h.color = color.white
             crosshair_v.color = color.white
