@@ -7,26 +7,29 @@ import random
 app = Ursina()
 
 # Configuration
-WORLD_SIZE = 20
+WORLD_SIZE = 32
 MAX_HEIGHT = 10
 pnoise = PerlinNoise()
 
 # 9-slot hotbar palette (Minecraft-like)
-HOTBAR_PALETTE = ['grass','stone','wood','leaves','dirt','sand','cobble','glass','brick']
+HOTBAR_PALETTE = ['grass','stone','wood','leaves','dirt','sand','cobble','glass','brick','cactus']
 
 # Simple color map for the 9 items
 LEAF_COLOR = color.rgb(0.35, 0.52, 0.3)
 WOOD_COLOR = color.rgb(0.6, 0.4, 0.2)  # Distinct wood color
+CACTUS_COLOR = color.rgb(0.2, 0.6, 0.2)  # Green cactus color
+SAND_COLOR = color.rgb(0.93, 0.87, 0.68)  # Sandy color
 ITEM_COLORS = {
     'grass': color.green,
     'stone': color.dark_gray,
     'wood': WOOD_COLOR,
     'leaves': LEAF_COLOR,
     'dirt': color.brown,
-    'sand': color.yellow,
+    'sand': SAND_COLOR,
     'cobble': color.gray,
     'glass': color.cyan,
     'brick': color.red,
+    'cactus': CACTUS_COLOR,
 }
 
 # 9 slots holding {type, count}
@@ -217,6 +220,9 @@ class Voxel(Button):
             self.hardness = 0.5
     
     def input(self, key):
+        # Don't allow breaking or placing if crafting UI is open
+        if crafting_open:
+            return
         if self.hovered and distance(self.world_position, camera.world_position) <= 7:
             if key == 'left mouse down':
                 self.breaking_start_time = time.time()
@@ -260,6 +266,10 @@ class Voxel(Button):
                     drop_item(self.position, 'dirt')
                 elif self.col == LEAF_COLOR:
                     drop_item(self.position, 'leaves')
+                elif self.col == SAND_COLOR:
+                    drop_item(self.position, 'sand')
+                elif self.col == CACTUS_COLOR:
+                    drop_item(self.position, 'cactus')
                 destroy(self)
             else:
                 self.scale = 0.8 + (0.2 * (1 - progress))
@@ -275,26 +285,80 @@ def generate_tree(x, y, z):
         for lz in range(-1, 2):
             Voxel(position=(x + lx, y + 3, z + lz), col=LEAF_COLOR)
 
+def generate_cactus(x, y, z):
+    # Cactus trunk
+    height = random.randint(2, 4)
+    for i in range(height):
+        Voxel(position=(x, y + i, z), col=CACTUS_COLOR)
+
+def get_biome(x, z):
+    """Determine biome based on position."""
+    # Divide world into 3 vertical strips
+    biome_width = WORLD_SIZE / 3
+    if z < biome_width:
+        return 'plains'
+    elif z < biome_width * 2:
+        return 'mountains'
+    else:
+        return 'desert'
+
 def generate_world():
     for z in range(WORLD_SIZE):
         for x in range(WORLD_SIZE):
+            biome = get_biome(x, z)
             noise_val = pnoise([x * 0.1, z * 0.1])
-            height = int((noise_val + 1) * MAX_HEIGHT / 2)
+            
+            # Different terrain generation per biome
+            if biome == 'plains':
+                # Flat terrain
+                height = int((noise_val + 1) * 4) + 2
+                tree_chance = 0.01
+                surface_block = color.green
+                underground_block = color.brown
+            elif biome == 'mountains':
+                # Extreme terrain
+                height = int((noise_val + 1) * MAX_HEIGHT * 1.5)
+                tree_chance = 0.03
+                surface_block = color.green
+                underground_block = color.dark_gray
+            else:  # desert
+                # Sandy terrain, flatter
+                height = int((noise_val + 1) * 3) + 2
+                tree_chance = 0
+                surface_block = SAND_COLOR
+                underground_block = SAND_COLOR
             
             for y in range(height):
                 if y == height - 1:
-                    block_color = color.green  # Grass on top
+                    block_color = surface_block
                 elif y > height - 4:
-                    block_color = color.brown  # Dirt below grass
+                    block_color = underground_block
                 else:
-                    block_color = color.dark_gray  # Stone deep down
+                    block_color = color.dark_gray
                 Voxel(position=(x, y, z), col=block_color)
             
-            # Random trees
-            if random.random() < 0.02 and height > 2:
-                generate_tree(x, height, z)
+            # Biome-specific features
+            if biome == 'plains' or biome == 'mountains':
+                # Trees in plains and mountains
+                if random.random() < tree_chance and height > 2:
+                    generate_tree(x, height, z)
+            elif biome == 'desert':
+                # Cacti in desert
+                if random.random() < 0.03 and height > 2:
+                    generate_cactus(x, height, z)
 
 generate_world()
+
+# Biome display
+biome_text = Text(
+    parent=camera.ui,
+    text='Biome: Unknown',
+    position=(0.65, 0.45),
+    origin=(0, 0),
+    scale=2,
+    color=color.white,
+    z=0.5,
+)
 
 player = FirstPersonController()
 player.cursor.visible = True
@@ -474,6 +538,9 @@ def update_hotbar_slots():
 crafting_open = False
 crafting_grid = [[None, None], [None, None]]  # 2x2 grid storing item types
 crafting_entities = []  # UI entities for crafting
+crafting_slot_visuals = []  # Visual representations of items in crafting slots
+dragged_item = None  # Currently dragged item
+dragged_item_visual = None  # Visual entity following mouse
 CRAFTING_RECIPES = {
     # Format: ((item1, item2), (item3, item4)): output
     (('wood', 'wood'), ('wood', 'wood')): 'cobble',
@@ -528,7 +595,20 @@ for row in range(2):
             z=-0.01
         )
         crafting_entities.append(slot)
-        crafting_slots.append(slot)
+        crafting_slots.append((slot, row, col))
+        
+        # Add visual entity for item in this slot
+        item_visual = Entity(
+            parent=crafting_panel,
+            model='quad',
+            scale=(0.08, 0.08),
+            position=(x_pos, y_pos),
+            color=color.white,
+            z=-0.02,
+            enabled=False
+        )
+        crafting_slot_visuals.append(item_visual)
+        crafting_entities.append(item_visual)
 
 # Output slot
 output_slot = Entity(
@@ -555,7 +635,7 @@ crafting_title = Text(
 crafting_entities.append(crafting_title)
 
 def input(key):
-    global selected_slot
+    global selected_slot, dragged_item, dragged_item_visual
     if key == 'f11':
         window.fullscreen = not window.fullscreen
     if key in [str(i) for i in range(1,10)]:
@@ -563,6 +643,62 @@ def input(key):
         update_selection_border()
     if key == 'c':
         toggle_crafting()
+    
+    # Handle mouse clicks for crafting drag and drop
+    if crafting_open:
+        if key == 'left mouse down':
+            # Check if clicking on hotbar slot
+            mouse_pos = mouse.position
+            for i, icon in enumerate(hotbar_slot_icons):
+                if i < len(hotbar_slots):
+                    slot_screen_x = SLOT_SCREEN_X[i]
+                    slot_screen_y = HOTBAR_SCREEN_Y
+                    # Check if mouse is within slot bounds (approximate)
+                    if abs(mouse_pos.x - slot_screen_x) < 0.05 and abs(mouse_pos.y - slot_screen_y) < 0.06:
+                        s = hotbar_slots[i]
+                        if s['type'] is not None and s['count'] > 0:
+                            # Start dragging
+                            dragged_item = {'type': s['type'], 'from_hotbar': True, 'slot': i}
+                            dragged_item_visual = Entity(
+                                parent=camera.ui,
+                                model='quad',
+                                scale=(0.06, 0.06),
+                                position=mouse_pos,
+                                color=ITEM_COLORS.get(s['type'], color.white),
+                                z=1
+                            )
+                            break
+        
+        elif key == 'left mouse up':
+            # Drop item
+            if dragged_item:
+                mouse_pos = mouse.position
+                # Check if dropped on crafting slot
+                for idx, (slot_entity, row, col) in enumerate(crafting_slots):
+                    slot_pos = slot_entity.position
+                    # Convert slot position to screen coordinates (approximate)
+                    slot_screen_x = slot_pos.x * 0.4  # Scale by crafting panel scale
+                    slot_screen_y = slot_pos.y * 0.4
+                    
+                    if abs(mouse_pos.x - slot_screen_x) < 0.06 and abs(mouse_pos.y - slot_screen_y) < 0.06:
+                        # Place item in crafting slot
+                        if crafting_grid[row][col] is None:
+                            crafting_grid[row][col] = dragged_item['type']
+                            # Remove from hotbar
+                            if dragged_item['from_hotbar']:
+                                hotbar_slots[dragged_item['slot']]['count'] -= 1
+                                if hotbar_slots[dragged_item['slot']]['count'] <= 0:
+                                    hotbar_slots[dragged_item['slot']]['type'] = None
+                            # Update visual
+                            crafting_slot_visuals[idx].color = ITEM_COLORS.get(dragged_item['type'], color.white)
+                            crafting_slot_visuals[idx].enabled = True
+                            break
+                
+                # Clean up dragged item
+                if dragged_item_visual:
+                    destroy(dragged_item_visual)
+                    dragged_item_visual = None
+                dragged_item = None
 
 def update():
     # Sprinting mechanics
@@ -601,6 +737,25 @@ def update():
             crosshair_h.color = color.white
             crosshair_v.color = color.white
             reach_indicator.text = ''
+    except:
+        pass
+    
+    # Update dragged item position to follow mouse
+    global dragged_item_visual
+    if dragged_item_visual:
+        dragged_item_visual.position = mouse.position
+    
+    # Update biome display
+    try:
+        player_x = int(player.position.x)
+        player_z = int(player.position.z)
+        current_biome = get_biome(player_x, player_z)
+        biome_names = {
+            'plains': 'Plains',
+            'mountains': 'Mountains', 
+            'desert': 'Desert'
+        }
+        biome_text.text = f'Biome: {biome_names.get(current_biome, "Unknown")}'
     except:
         pass
     
